@@ -700,13 +700,25 @@ class GoApp:
         if self.last_speech:
             self.voice.speak(self.last_speech)
 
-    def _get_cell_size(self):
-        if self.engine.N == 9:
-            return 70
-        elif self.engine.N == 13:
-            return 52
-        else:
-            return 38
+    def _get_cell_size(self, N=None):
+        """根据窗口可用空间动态计算格子大小"""
+        if N is None:
+            N = self.engine.N
+        # 棋盘最大尺寸限制
+        max_board_size = 700
+        return max(35, max_board_size // N)
+
+    def _update_window_size(self):
+        """根据棋盘大小更新窗口大小"""
+        N = self.engine.N
+        cell = self._get_cell_size()
+        board_size = cell * (N - 1) + cell + 60  # 棋盘 + 坐标
+        # 窗口总宽度 = 棋盘 + 右侧面板 (约380)
+        total_width = max(board_size + 400, 900)
+        # 窗口高度 = 棋盘 + 一些边距
+        total_height = max(board_size + 100, 600)
+        self.root.geometry(f"{total_width}x{total_height}")
+        self.root.minsize(int(total_width * 0.7), int(total_height * 0.7))
 
     def _draw_board(self):
         """绘制棋盘"""
@@ -951,6 +963,7 @@ class GoApp:
         size = self.settings.get('board_size', 9)
         size_display = f"{size}路"
         self.engine.new_game(size)
+        self._update_window_size()  # 根据棋盘大小调整窗口
         self._update_history()
         self._update_scores()
         self._draw_board()
