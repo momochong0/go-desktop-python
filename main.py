@@ -20,18 +20,18 @@ class VoiceSystem:
         self.speed = 150
         self.voices = []
         self.chinese_voice_id = None
-        self._first_speak_allowed = False  # 首次播报需要延迟
-        self._init_engine()
+        self._initialized = False
+        self._init_engine()  # 延迟到初始化
 
     def _init_engine(self):
         try:
             import pyttsx3
+            # 先创建引擎，不做任何设置
             self.engine = pyttsx3.init()
-            # 多次停止，清空可能缓存的待播放内容
-            for _ in range(3):
-                self.engine.stop()
+            # 立即清空任何可能缓存的待播放内容
+            self.engine.stop()
+            # 设置属性
             self.voices = self.engine.getProperty('voices')
-            # 选择中文语音
             for voice in self.voices:
                 if 'chinese' in voice.name.lower() or 'zh' in voice.name.lower():
                     self.chinese_voice_id = voice.id
@@ -39,19 +39,13 @@ class VoiceSystem:
                     break
             self.engine.setProperty('rate', self.speed)
             self.engine.setProperty('volume', 0.0)  # 先静音
-            # 清空任何可能缓存的内容
+            # 再次清空
             self.engine.stop()
             self.engine.setProperty('volume', 1.0)  # 恢复音量
+            self._initialized = True
             print("[TTS] 语音引擎初始化成功")
             if self.chinese_voice_id:
                 print(f"[TTS] 使用语音: {self.chinese_voice_id}")
-            # 延迟允许首次播报
-            import threading
-            def enable_first():
-                import time
-                time.sleep(1.0)
-                self._first_speak_allowed = True
-            threading.Thread(target=enable_first, daemon=True).start()
         except ImportError:
             print("[TTS] pyttsx3 未安装，将使用内置语音")
         except Exception as e:
@@ -454,10 +448,14 @@ class GoApp:
         # UI
         self._create_ui()
 
-        # 先设置窗口大小（根据棋盘尺寸）
+        # 先读取棋盘大小设置，并用这个大小初始化引擎和窗口
+        size = self.settings.get('board_size', 9)
+        self.engine.new_game(size)  # 用正确的大小初始化引擎
+
+        # 设置窗口大小（根据棋盘尺寸）
         self._update_window_size()
 
-        # 开始新游戏（不播报，等窗口显示后再播报）
+        # 开始新游戏（不播报）
         self.new_game_no_speak()
 
         # 窗口显示后延迟播报（等待2秒确保TTS完全就绪）
