@@ -20,15 +20,16 @@ class VoiceSystem:
         self.speed = 150
         self.voices = []
         self.chinese_voice_id = None
-        self._init_done = False  # 标记初始化是否完成
+        self._first_speak_allowed = False  # 首次播报需要延迟
         self._init_engine()
 
     def _init_engine(self):
         try:
             import pyttsx3
             self.engine = pyttsx3.init()
-            # 先停止任何正在进行的播放
-            self.engine.stop()
+            # 多次停止，清空可能缓存的待播放内容
+            for _ in range(3):
+                self.engine.stop()
             self.voices = self.engine.getProperty('voices')
             # 选择中文语音
             for voice in self.voices:
@@ -37,20 +38,24 @@ class VoiceSystem:
                     self.engine.setProperty('voice', voice.id)
                     break
             self.engine.setProperty('rate', self.speed)
-            self.engine.setProperty('volume', 1.0)
-            # 再次停止，确保设置属性时没有触发意外播放
+            self.engine.setProperty('volume', 0.0)  # 先静音
+            # 清空任何可能缓存的内容
             self.engine.stop()
+            self.engine.setProperty('volume', 1.0)  # 恢复音量
             print("[TTS] 语音引擎初始化成功")
             if self.chinese_voice_id:
                 print(f"[TTS] 使用语音: {self.chinese_voice_id}")
-            # 标记初始化完成
-            self._init_done = True
+            # 延迟允许首次播报
+            import threading
+            def enable_first():
+                import time
+                time.sleep(1.0)
+                self._first_speak_allowed = True
+            threading.Thread(target=enable_first, daemon=True).start()
         except ImportError:
             print("[TTS] pyttsx3 未安装，将使用内置语音")
-            self._init_done = True  # 标记完成，即使没有引擎
         except Exception as e:
             print(f"[TTS] 语音引擎初始化失败: {e}")
-            self._init_done = True
 
     def set_speed(self, rate):
         """设置语速 0.7-1.2 -> 100-200"""
@@ -61,13 +66,6 @@ class VoiceSystem:
     def speak(self, text, callback=None):
         """异步朗读"""
         if not text or self.muted:
-            if callback:
-                callback()
-            return
-
-        # 确保引擎初始化完成后再朗读
-        if not self._init_done:
-            print("[TTS] 引擎尚未初始化完成，跳过朗读")
             if callback:
                 callback()
             return
@@ -462,8 +460,8 @@ class GoApp:
         # 开始新游戏（不播报，等窗口显示后再播报）
         self.new_game_no_speak()
 
-        # 窗口显示后延迟播报
-        self.root.after(500, self._delayed_intro)
+        # 窗口显示后延迟播报（等待2秒确保TTS完全就绪）
+        self.root.after(2000, self._delayed_intro)
 
         # 启动主循环
         self.root.mainloop()
@@ -710,11 +708,11 @@ class GoApp:
         self._save_settings()
         self._update_window_size()
         self.new_game_no_speak()
-        # 切换棋盘后播报
+        # 切换棋盘后延迟播报
         rank = RANK_TABLE[self.engine.rank_idx]
         msg = f"棋盘已切换到{value}，对手是{rank[0]}水平。"
         self._update_speech(msg)
-        self.voice.speak(msg)
+        self.root.after(500, lambda: self.voice.speak(msg))
 
     def _toggle_mute(self):
         muted = self.voice.toggle_mute()
