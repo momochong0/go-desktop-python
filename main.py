@@ -20,32 +20,52 @@ class VoiceSystem:
         self.speed = 150
         self.voices = []
         self.chinese_voice_id = None
-        self._initialized = False
-        self._init_engine()  # 延迟到初始化
+        self._engine_ready = False  # 引擎是否已准备就绪
 
-    def _init_engine(self):
+    def _ensure_engine(self):
+        """确保引擎已初始化（延迟初始化）"""
+        if self.engine is not None:
+            return
         try:
             import pyttsx3
-            # 先创建引擎，不做任何设置
+            import time
+            
+            # 创建引擎
             self.engine = pyttsx3.init()
-            # 立即清空任何可能缓存的待播放内容
-            self.engine.stop()
-            # 设置属性
+            
+            # 多次清空，确保没有缓存的声音
+            for _ in range(5):
+                self.engine.stop()
+                time.sleep(0.05)
+            
+            # 获取语音列表
             self.voices = self.engine.getProperty('voices')
+            
+            # 选择中文语音
             for voice in self.voices:
                 if 'chinese' in voice.name.lower() or 'zh' in voice.name.lower():
                     self.chinese_voice_id = voice.id
                     self.engine.setProperty('voice', voice.id)
                     break
+            
+            # 设置语速
             self.engine.setProperty('rate', self.speed)
-            self.engine.setProperty('volume', 0.0)  # 先静音
-            # 再次清空
+            
+            # 先静音
+            self.engine.setProperty('volume', 0.0)
             self.engine.stop()
-            self.engine.setProperty('volume', 1.0)  # 恢复音量
-            self._initialized = True
+            
+            # 延迟后恢复音量
+            def restore_volume():
+                time.sleep(0.5)
+                if self.engine:
+                    self.engine.setProperty('volume', 1.0)
+            
+            threading.Thread(target=restore_volume, daemon=True).start()
+            
+            # 标记引擎就绪
+            self._engine_ready = True
             print("[TTS] 语音引擎初始化成功")
-            if self.chinese_voice_id:
-                print(f"[TTS] 使用语音: {self.chinese_voice_id}")
         except ImportError:
             print("[TTS] pyttsx3 未安装，将使用内置语音")
         except Exception as e:
@@ -65,6 +85,8 @@ class VoiceSystem:
             return
 
         def do_speak():
+            # 确保引擎已初始化
+            self._ensure_engine()
             if not self.engine:
                 if callback:
                     callback()
@@ -738,7 +760,13 @@ class GoApp:
         total_width = max(board_size + 400, 900)
         # 窗口高度 = 棋盘 + 一些边距
         total_height = max(board_size + 100, 600)
+        
+        # 设置窗口大小
         self.root.geometry(f"{total_width}x{total_height}")
+        # 强制更新窗口尺寸
+        self.root.update_idletasks()
+        
+        # 设置最小尺寸
         self.root.minsize(int(total_width * 0.7), int(total_height * 0.7))
 
     def _draw_board(self):
