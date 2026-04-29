@@ -27,6 +27,8 @@ class VoiceSystem:
         try:
             import pyttsx3
             self.engine = pyttsx3.init()
+            # 先停止任何正在进行的播放
+            self.engine.stop()
             self.voices = self.engine.getProperty('voices')
             # 选择中文语音
             for voice in self.voices:
@@ -36,6 +38,8 @@ class VoiceSystem:
                     break
             self.engine.setProperty('rate', self.speed)
             self.engine.setProperty('volume', 1.0)
+            # 再次停止，确保设置属性时没有触发意外播放
+            self.engine.stop()
             print("[TTS] 语音引擎初始化成功")
             if self.chinese_voice_id:
                 print(f"[TTS] 使用语音: {self.chinese_voice_id}")
@@ -762,14 +766,14 @@ class GoApp:
             letter_idx += 1
         for i in range(N):
             x = 30 + offset + i * cell
-            # 列字母 (顶部和底部)
+            # 列字母 (顶部和底部) - 增大字体和间距
             col_letter = letters[i]
-            self.canvas.create_text(x, 12, text=col_letter, font=('Arial', 9), fill='#5a4000')
-            self.canvas.create_text(x, 52 + size, text=col_letter, font=('Arial', 9), fill='#5a4000')
-            # 行数字 (左侧和右侧) - 从上到下 1,2,3...N
+            self.canvas.create_text(x, 15, text=col_letter, font=('Arial', 11, 'bold'), fill='#5a4000')
+            self.canvas.create_text(x, size + 48, text=col_letter, font=('Arial', 11, 'bold'), fill='#5a4000')
+            # 行数字 (左侧和右侧) - 增大字体和间距
             row_num = i + 1
-            self.canvas.create_text(18, 30 + offset + i * cell, text=str(row_num), font=('Arial', 9), fill='#5a4000')
-            self.canvas.create_text(52 + size, 30 + offset + i * cell, text=str(row_num), font=('Arial', 9), fill='#5a4000')
+            self.canvas.create_text(15, 30 + offset + i * cell, text=str(row_num), font=('Arial', 11, 'bold'), fill='#5a4000')
+            self.canvas.create_text(size + 48, 30 + offset + i * cell, text=str(row_num), font=('Arial', 11, 'bold'), fill='#5a4000')
 
         # 绘制星位
         star_points = self.engine._get_star_points()
