@@ -442,8 +442,6 @@ class GoApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("围棋小课堂")
-        self.root.geometry("1200x800")
-        self.root.minsize(900, 600)
         self.root.configure(bg='#ffecd2')
 
         self.engine = GoEngine()
@@ -458,8 +456,25 @@ class GoApp:
         # UI
         self._create_ui()
 
-        # 开始新游戏
-        self.new_game()
+        # 先设置窗口大小（根据棋盘尺寸）
+        self._update_window_size()
+
+        # 开始新游戏（不播报，等窗口显示后再播报）
+        self.new_game_no_speak()
+
+        # 窗口显示后延迟播报
+        self.root.after(500, self._delayed_intro)
+
+        # 启动主循环
+        self.root.mainloop()
+
+    def _delayed_intro(self):
+        """延迟播报开场白"""
+        rank = RANK_TABLE[self.engine.rank_idx]
+        size = self.settings.get('board_size', 9)
+        msg = f"新游戏！棋盘是{size}路。你下黑棋先走，对手是{rank[0]}水平。"
+        self._update_speech(msg)
+        self.voice.speak(msg)
 
     def _load_settings(self):
         """加载设置"""
@@ -693,7 +708,13 @@ class GoApp:
         self.settings['board_size'] = size_map.get(value, 9)
         self.settings['board_size_display'] = value
         self._save_settings()
-        self.new_game()
+        self._update_window_size()
+        self.new_game_no_speak()
+        # 切换棋盘后播报
+        rank = RANK_TABLE[self.engine.rank_idx]
+        msg = f"棋盘已切换到{value}，对手是{rank[0]}水平。"
+        self._update_speech(msg)
+        self.voice.speak(msg)
 
     def _toggle_mute(self):
         muted = self.voice.toggle_mute()
@@ -962,12 +983,22 @@ class GoApp:
 
         return "，".join(parts)
 
+    def new_game_no_speak(self):
+        """开始新游戏（不播报）"""
+        size = self.settings.get('board_size', 9)
+        size_display = f"{size}路"
+        self.engine.new_game(size)
+        self._update_history()
+        self._update_scores()
+        self._draw_board()
+        self._update_rank_ui()
+        self._update_status()
+
     def new_game(self):
         """开始新游戏"""
         size = self.settings.get('board_size', 9)
         size_display = f"{size}路"
         self.engine.new_game(size)
-        self._update_window_size()  # 根据棋盘大小调整窗口
         self._update_history()
         self._update_scores()
         self._draw_board()
