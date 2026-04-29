@@ -704,7 +704,7 @@ class GoApp:
         offset = cell * 0.4
         size = cell * (N - 1) + cell
 
-        self.canvas.config(width=size + 4, height=size + 4)
+        self.canvas.config(width=size + 60, height=size + 60)
 
         # 绘制棋盘背景（木纹渐变）
         for i in range(int(size)):
@@ -712,43 +712,56 @@ class GoApp:
             r = int(240 - ratio * 80)
             g = int(204 - ratio * 70)
             b = int(114 - ratio * 50)
-            self.canvas.create_line(0, i, size, i, fill=f'#{r:02x}{g:02x}{b:02x}')
+            self.canvas.create_line(30, 30 + i, 30 + size, 30 + i, fill=f'#{r:02x}{g:02x}{b:02x}')
 
         # 绘制网格线
         for i in range(N):
-            x = offset + i * cell
-            self.canvas.create_line(x, offset, x, offset + (N-1) * cell, fill='#7a5000', width=1)
-            y = offset + i * cell
-            self.canvas.create_line(offset, y, offset + (N-1) * cell, y, fill='#7a5000', width=1)
+            x = 30 + offset + i * cell
+            y = 30 + offset + i * cell
+            self.canvas.create_line(x, 30 + offset, x, 30 + offset + (N-1) * cell, fill='#7a5000', width=1)
+            self.canvas.create_line(30 + offset, y, 30 + offset + (N-1) * cell, y, fill='#7a5000', width=1)
+
+        # 绘制坐标标签 (列用字母 A-H，跳过 I，行为数字 1-9)
+        letters = 'ABCDEFGH'  # 围棋不使用 I
+        for i in range(N):
+            x = 30 + offset + i * cell
+            # 顶部字母
+            self.canvas.create_text(x, 12, text=letters[i % len(letters)], font=('Arial', 9), fill='#5a4000')
+            # 底部字母
+            self.canvas.create_text(x, 52 + size, text=letters[i % len(letters)], font=('Arial', 9), fill='#5a4000')
+            # 左侧数字
+            self.canvas.create_text(18, y, text=str(N - i), font=('Arial', 9), fill='#5a4000')
+            # 右侧数字
+            self.canvas.create_text(52 + size, y, text=str(N - i), font=('Arial', 9), fill='#5a4000')
 
         # 绘制星位
         star_points = self.engine._get_star_points()
         for r, c in star_points:
-            x = offset + c * cell
-            y = offset + r * cell
+            x = 30 + offset + c * cell
+            y = 30 + offset + r * cell
             self.canvas.create_oval(x-3, y-3, x+3, y+3, fill='#7a5000', outline='#7a5000')
 
         # 绘制棋子
         for r in range(N):
             for c in range(N):
                 if self.engine.board[r][c] != EMPTY:
-                    x = offset + c * cell
-                    y = offset + r * cell
+                    x = 30 + offset + c * cell
+                    y = 30 + offset + r * cell
                     self._draw_stone(x, y, self.engine.board[r][c])
 
         # 绘制最后一手标记
         if self.engine.history:
             last = self.engine.history[-1]
             if last['row'] >= 0:
-                x = offset + last['col'] * cell
-                y = offset + last['row'] * cell
+                x = 30 + offset + last['col'] * cell
+                y = 30 + offset + last['row'] * cell
                 color = 'white' if last['player'] == BLACK else '#333'
                 self.canvas.create_oval(x-6, y-6, x+6, y+6, fill=color, outline=color)
 
         # 劫标记
         if self.engine.ko_point:
-            x = offset + self.engine.ko_point[1] * cell
-            y = offset + self.engine.ko_point[0] * cell
+            x = 30 + offset + self.engine.ko_point[1] * cell
+            y = 30 + offset + self.engine.ko_point[0] * cell
             self.canvas.create_oval(x-15, y-15, x+15, y+15, outline='red', width=2)
 
         # 绑定点击事件
@@ -776,15 +789,16 @@ class GoApp:
         N = self.engine.N
         cell = self._get_cell_size()
         offset = cell * 0.4
+        board_offset = 30
 
-        col = int(round((event.x - offset) / cell))
-        row = int(round((event.y - offset) / cell))
+        col = int(round((event.x - board_offset - offset) / cell))
+        row = int(round((event.y - board_offset - offset) / cell))
 
         if row < 0 or row >= N or col < 0 or col >= N:
             return
 
-        x = offset + col * cell
-        y = offset + row * cell
+        x = board_offset + offset + col * cell
+        y = board_offset + offset + row * cell
         if abs(event.x - x) > cell * 0.46 or abs(event.y - y) > cell * 0.46:
             return
 
