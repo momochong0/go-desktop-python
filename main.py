@@ -721,18 +721,19 @@ class GoApp:
             self.canvas.create_line(x, 30 + offset, x, 30 + offset + (N-1) * cell, fill='#7a5000', width=1)
             self.canvas.create_line(30 + offset, y, 30 + offset + (N-1) * cell, y, fill='#7a5000', width=1)
 
-        # 绘制坐标标签 (列用字母 A-H，跳过 I，行为数字 1-9)
-        letters = 'ABCDEFGH'  # 围棋不使用 I
+        # 绘制坐标标签 (列用字母，跳过 I，行为数字)
+        # 围棋坐标: A B C D E F G H J (跳过 I)
+        letters = 'ABCDEFGHJ'
         for i in range(N):
             x = 30 + offset + i * cell
-            # 顶部字母
-            self.canvas.create_text(x, 12, text=letters[i % len(letters)], font=('Arial', 9), fill='#5a4000')
-            # 底部字母
-            self.canvas.create_text(x, 52 + size, text=letters[i % len(letters)], font=('Arial', 9), fill='#5a4000')
-            # 左侧数字
-            self.canvas.create_text(18, y, text=str(N - i), font=('Arial', 9), fill='#5a4000')
-            # 右侧数字
-            self.canvas.create_text(52 + size, y, text=str(N - i), font=('Arial', 9), fill='#5a4000')
+            # 列字母 (顶部和底部)
+            col_letter = letters[i] if i < len(letters) else letters[i % len(letters)]
+            self.canvas.create_text(x, 12, text=col_letter, font=('Arial', 9), fill='#5a4000')
+            self.canvas.create_text(x, 52 + size, text=col_letter, font=('Arial', 9), fill='#5a4000')
+            # 行数字 (左侧和右侧) - 从上到下 1,2,3...N
+            row_num = i + 1
+            self.canvas.create_text(18, 30 + offset + i * cell, text=str(row_num), font=('Arial', 9), fill='#5a4000')
+            self.canvas.create_text(52 + size, 30 + offset + i * cell, text=str(row_num), font=('Arial', 9), fill='#5a4000')
 
         # 绘制星位
         star_points = self.engine._get_star_points()
