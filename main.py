@@ -721,13 +721,25 @@ class GoApp:
             self.canvas.create_line(x, 30 + offset, x, 30 + offset + (N-1) * cell, fill='#7a5000', width=1)
             self.canvas.create_line(30 + offset, y, 30 + offset + (N-1) * cell, y, fill='#7a5000', width=1)
 
-        # 绘制坐标标签 (列用字母，跳过 I，行为数字)
-        # 围棋坐标: A B C D E F G H J (跳过 I)
-        letters = 'ABCDEFGHJ'
+        # 绘制坐标标签
+        # 围棋坐标规则：列用字母 A-T (跳过 I)，行用数字
+        # 9路: A-H J (9个), 13路: A-H J-M (13个), 19路: A-T (19个)
+        # 生成字母序列: A B C D E F G H J K L M N O P Q R S T (跳过 I)
+        letters = []
+        letter_idx = 0
+        alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        for _ in range(N):
+            letter = alphabet[letter_idx]
+            if letter != 'I':  # 跳过 I
+                letters.append(letter)
+            else:
+                letter_idx += 1
+                letters.append(alphabet[letter_idx])
+            letter_idx += 1
         for i in range(N):
             x = 30 + offset + i * cell
             # 列字母 (顶部和底部)
-            col_letter = letters[i] if i < len(letters) else letters[i % len(letters)]
+            col_letter = letters[i]
             self.canvas.create_text(x, 12, text=col_letter, font=('Arial', 9), fill='#5a4000')
             self.canvas.create_text(x, 52 + size, text=col_letter, font=('Arial', 9), fill='#5a4000')
             # 行数字 (左侧和右侧) - 从上到下 1,2,3...N
