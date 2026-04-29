@@ -20,6 +20,7 @@ class VoiceSystem:
         self.speed = 150
         self.voices = []
         self.chinese_voice_id = None
+        self._init_done = False  # 标记初始化是否完成
         self._init_engine()
 
     def _init_engine(self):
@@ -38,10 +39,14 @@ class VoiceSystem:
             print("[TTS] 语音引擎初始化成功")
             if self.chinese_voice_id:
                 print(f"[TTS] 使用语音: {self.chinese_voice_id}")
+            # 标记初始化完成
+            self._init_done = True
         except ImportError:
             print("[TTS] pyttsx3 未安装，将使用内置语音")
+            self._init_done = True  # 标记完成，即使没有引擎
         except Exception as e:
             print(f"[TTS] 语音引擎初始化失败: {e}")
+            self._init_done = True
 
     def set_speed(self, rate):
         """设置语速 0.7-1.2 -> 100-200"""
@@ -52,6 +57,13 @@ class VoiceSystem:
     def speak(self, text, callback=None):
         """异步朗读"""
         if not text or self.muted:
+            if callback:
+                callback()
+            return
+
+        # 确保引擎初始化完成后再朗读
+        if not self._init_done:
+            print("[TTS] 引擎尚未初始化完成，跳过朗读")
             if callback:
                 callback()
             return
@@ -948,7 +960,12 @@ class GoApp:
         rank = RANK_TABLE[self.engine.rank_idx]
         msg = f"新游戏！棋盘是{size_display}。你下黑棋先走，对手是{rank[0]}水平。"
         self._update_speech(msg)
-        self.voice.speak(msg, callback=lambda: None)
+        # 延迟一点再朗读，确保引擎已完全初始化
+        def delayed_speak():
+            import time
+            time.sleep(0.3)
+            self.voice.speak(msg, callback=lambda: None)
+        threading.Thread(target=delayed_speak, daemon=True).start()
 
     def pass_move(self):
         """跳过"""
