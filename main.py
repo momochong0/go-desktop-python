@@ -29,43 +29,36 @@ class VoiceSystem:
         try:
             import pyttsx3
             import time
-            
+
             # 创建引擎
             self.engine = pyttsx3.init()
-            
-            # 多次清空，确保没有缓存的声音
-            for _ in range(5):
-                self.engine.stop()
-                time.sleep(0.05)
-            
+
             # 获取语音列表
             self.voices = self.engine.getProperty('voices')
-            
+
             # 选择中文语音
             for voice in self.voices:
                 if 'chinese' in voice.name.lower() or 'zh' in voice.name.lower():
                     self.chinese_voice_id = voice.id
                     self.engine.setProperty('voice', voice.id)
                     break
-            
+
             # 设置语速
             self.engine.setProperty('rate', self.speed)
-            
-            # 先静音
+
+            # ★ 关键：先静音，做一次空的预热 runAndWait，
+            #   把 SAPI 引擎内部任何残留内容全部在无声状态下清空
             self.engine.setProperty('volume', 0.0)
-            self.engine.stop()
-            
-            # 延迟后恢复音量
-            def restore_volume():
-                time.sleep(0.5)
-                if self.engine:
-                    self.engine.setProperty('volume', 1.0)
-            
-            threading.Thread(target=restore_volume, daemon=True).start()
-            
-            # 标记引擎就绪
+            self.engine.say(' ')          # 一个空格触发一次完整的合成
+            self.engine.runAndWait()      # 阻塞直到播完（无声）
+
+            # 预热结束，恢复音量
+            self.engine.setProperty('volume', 1.0)
+
             self._engine_ready = True
             print("[TTS] 语音引擎初始化成功")
+            if self.chinese_voice_id:
+                print(f"[TTS] 使用语音: {self.chinese_voice_id}")
         except ImportError:
             print("[TTS] pyttsx3 未安装，将使用内置语音")
         except Exception as e:
@@ -470,15 +463,15 @@ class GoApp:
         # UI
         self._create_ui()
 
-        # 先读取棋盘大小设置，并用这个大小初始化引擎和窗口
+        # 读取棋盘大小，初始化引擎
         size = self.settings.get('board_size', 9)
-        self.engine.new_game(size)  # 用正确的大小初始化引擎
+        self.engine.new_game(size)
 
-        # 设置窗口大小（根据棋盘尺寸）
-        self._update_window_size()
-
-        # 开始新游戏（不播报）
+        # 先绘制棋盘（这会确定 canvas 的实际大小）
         self.new_game_no_speak()
+
+        # ★ 在画板绘制完成之后再设置窗口大小，防止被覆盖
+        self._update_window_size()
 
         # 窗口显示后延迟播报（等待2秒确保TTS完全就绪）
         self.root.after(2000, self._delayed_intro)
@@ -755,19 +748,18 @@ class GoApp:
         """根据棋盘大小更新窗口大小"""
         N = self.engine.N
         cell = self._get_cell_size()
-        board_size = cell * (N - 1) + cell + 60  # 棋盘 + 坐标
-        # 窗口总宽度 = 棋盘 + 右侧面板 (约380)
-        total_width = max(board_size + 400, 900)
-        # 窗口高度 = 棋盘 + 一些边距
-        total_height = max(board_size + 100, 600)
-        
-        # 设置窗口大小
+        # canvas 大小：棋盘线 + 坐标标签
+        canvas_size = cell * (N - 1) + cell + 60
+        # board_frame padx=32 两侧共 64
+        board_area = canvas_size + 64
+        # 左侧 padx(0,20) + 右侧面板 320 + main_frame padx=20 两侧 40
+        total_width = board_area + 20 + 320 + 40
+        # 高度：title(~60) + board_area + status(~50) + 边距
+        total_height = max(board_area + 160, 660)
+
         self.root.geometry(f"{total_width}x{total_height}")
-        # 强制更新窗口尺寸
         self.root.update_idletasks()
-        
-        # 设置最小尺寸
-        self.root.minsize(int(total_width * 0.7), int(total_height * 0.7))
+        self.root.minsize(900, 600)
 
     def _draw_board(self):
         """绘制棋盘"""
