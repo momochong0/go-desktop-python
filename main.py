@@ -14,96 +14,99 @@ import os
 # 语音系统
 # ============================================================
 class VoiceSystem:
+    """
+    使用单一持久后台线程 + 队列驱动 TTS。
+    SAPI5 COM 对象必须在创建它的线程中被持续使用，
+    因此引擎的创建和所有 say/runAndWait 调用都在
+    同一个 _worker 线程里完成，避免跨线程使用 COM 对象。
+    """
+
+    _STOP_SENTINEL = object()   # 用于通知工作线程退出
+
     def __init__(self):
-        self.engine = None
         self.muted = False
         self.speed = 150
-        self.voices = []
-        self.chinese_voice_id = None
-        self._engine_ready = False  # 引擎是否已准备就绪
+        self._queue = queue.Queue()
+        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self._worker_thread.start()
 
-    def _ensure_engine(self):
-        """确保引擎已初始化（延迟初始化）"""
-        if self.engine is not None:
-            return
+    # ------------------------------------------------------------------
+    # 工作线程：所有引擎操作都在这里
+    # ------------------------------------------------------------------
+    def _worker(self):
+        engine = None
         try:
             import pyttsx3
-            import time
-
-            # 创建引擎
-            self.engine = pyttsx3.init()
-
-            # 获取语音列表
-            self.voices = self.engine.getProperty('voices')
-
-            # 选择中文语音
-            for voice in self.voices:
-                if 'chinese' in voice.name.lower() or 'zh' in voice.name.lower():
-                    self.chinese_voice_id = voice.id
-                    self.engine.setProperty('voice', voice.id)
+            engine = pyttsx3.init()
+            voices = engine.getProperty('voices')
+            for v in voices:
+                if 'chinese' in v.name.lower() or 'zh' in v.name.lower():
+                    engine.setProperty('voice', v.id)
+                    print(f"[TTS] 使用语音: {v.id}")
                     break
+            engine.setProperty('rate', self.speed)
 
-            # 设置语速
-            self.engine.setProperty('rate', self.speed)
-
-            # ★ 关键：先静音，做一次空的预热 runAndWait，
-            #   把 SAPI 引擎内部任何残留内容全部在无声状态下清空
-            self.engine.setProperty('volume', 0.0)
-            self.engine.say(' ')          # 一个空格触发一次完整的合成
-            self.engine.runAndWait()      # 阻塞直到播完（无声）
-
-            # 预热结束，恢复音量
-            self.engine.setProperty('volume', 1.0)
-
-            self._engine_ready = True
+            # 静音预热：清空 SAPI 残留内容
+            engine.setProperty('volume', 0.0)
+            engine.say(' ')
+            engine.runAndWait()
+            engine.setProperty('volume', 1.0)
             print("[TTS] 语音引擎初始化成功")
-            if self.chinese_voice_id:
-                print(f"[TTS] 使用语音: {self.chinese_voice_id}")
         except ImportError:
-            print("[TTS] pyttsx3 未安装，将使用内置语音")
+            print("[TTS] pyttsx3 未安装，语音功能不可用")
+            engine = None
         except Exception as e:
             print(f"[TTS] 语音引擎初始化失败: {e}")
+            engine = None
 
+        # 进入消费循环
+        while True:
+            item = self._queue.get()
+            if item is self._STOP_SENTINEL:
+                break
+            text, callback, rate_override = item
+
+            if engine and text and not self.muted:
+                try:
+                    if rate_override is not None:
+                        engine.setProperty('rate', rate_override)
+                    engine.say(text)
+                    engine.runAndWait()
+                except Exception as e:
+                    print(f"[TTS] 朗读失败: {e}")
+
+            if callback:
+                try:
+                    callback()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # 公共接口
+    # ------------------------------------------------------------------
     def set_speed(self, rate):
         """设置语速 0.7-1.2 -> 100-200"""
         self.speed = int(100 + (rate - 0.7) * 500)
-        if self.engine:
-            self.engine.setProperty('rate', max(80, min(300, self.speed)))
 
     def speak(self, text, callback=None):
-        """异步朗读"""
-        if not text or self.muted:
+        """异步朗读（立即返回，由工作线程处理）"""
+        if not text:
             if callback:
                 callback()
             return
-
-        def do_speak():
-            # 确保引擎已初始化
-            self._ensure_engine()
-            if not self.engine:
-                if callback:
-                    callback()
-                return
-            try:
-                clean = self._clean_text(text)
-                if clean and not self.muted:
-                    self.engine.say(clean)
-                    self.engine.runAndWait()
-            except Exception as e:
-                print(f"[TTS] 朗读失败: {e}")
-            if callback:
-                callback()
-
-        thread = threading.Thread(target=do_speak, daemon=True)
-        thread.start()
+        clean = self._clean_text(text)
+        if clean:
+            self._queue.put((clean, callback, self.speed if self.speed != 150 else None))
+        elif callback:
+            callback()
 
     def stop(self):
-        """停止朗读"""
-        if self.engine:
-            try:
-                self.engine.stop()
-            except:
-                pass
+        """清空待播队列（不停当前正在播的一句，SAPI 不支持跨线程 stop）"""
+        try:
+            while not self._queue.empty():
+                self._queue.get_nowait()
+        except Exception:
+            pass
 
     def toggle_mute(self):
         """切换静音"""
@@ -1024,12 +1027,7 @@ class GoApp:
         rank = RANK_TABLE[self.engine.rank_idx]
         msg = f"新游戏！棋盘是{size_display}。你下黑棋先走，对手是{rank[0]}水平。"
         self._update_speech(msg)
-        # 延迟一点再朗读，确保引擎已完全初始化
-        def delayed_speak():
-            import time
-            time.sleep(0.3)
-            self.voice.speak(msg, callback=lambda: None)
-        threading.Thread(target=delayed_speak, daemon=True).start()
+        self.voice.speak(msg)
 
     def pass_move(self):
         """跳过"""
