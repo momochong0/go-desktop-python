@@ -9,122 +9,183 @@ import queue
 import random
 import json
 import os
+import tempfile
+import winsound
 
 # ============================================================
-# 语音系统
+# 语音系统（WAV文件 + winsound 播放，彻底绕开COM线程问题）
 # ============================================================
 class VoiceSystem:
     """
-    使用单一持久后台线程 + 队列驱动 TTS。
-    SAPI5 COM 对象必须在创建它的线程中被持续使用，
-    因此引擎的创建和所有 say/runAndWait 调用都在
-    同一个 _worker 线程里完成，避免跨线程使用 COM 对象。
+    方案：
+      1. 后台线程用 pyttsx3.save_to_file() 生成 WAV 文件（不受COM线程模型影响）
+      2. 生成完毕后切回主线程，用 winsound.PlaySound() 播放 WAV
+      3. 播放完成后删除临时 WAV 文件
+    优点：彻底绕开后台线程中 SAPI5 runAndWait() 不发声的问题。
     """
 
-    _STOP_SENTINEL = object()   # 用于通知工作线程退出
-
-    def __init__(self):
+    def __init__(self, root=None):
+        self.root = root          # Tk 根窗口，用于 after() 切回主线程
         self.muted = False
         self.speed = 150
-        self._queue = queue.Queue()
-        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self._worker_thread.start()
+        self.engine = None
+        self._engine_ready = False
+        self.temp_dir = tempfile.mkdtemp(prefix='go_voice_')
+        self.current_wav = None   # 当前正在播放的 WAV 路径
+        self._wav_counter = 0     # 生成唯一文件名
 
-    # ------------------------------------------------------------------
-    # 工作线程：所有引擎操作都在这里
-    # ------------------------------------------------------------------
-    def _worker(self):
-        engine = None
+    def init_engine(self):
+        """在主线程调用（延迟初始化）"""
+        if self._engine_ready:
+            return
         try:
             import pyttsx3
-            engine = pyttsx3.init()
-            voices = engine.getProperty('voices')
+            self.engine = pyttsx3.init()
+            voices = self.engine.getProperty('voices')
             for v in voices:
                 if 'chinese' in v.name.lower() or 'zh' in v.name.lower():
-                    engine.setProperty('voice', v.id)
-                    print(f"[TTS] 使用语音: {v.id}")
+                    self.engine.setProperty('voice', v.id)
+                    print(f"[TTS] 使用语音: {v.name}", flush=True)
                     break
-            engine.setProperty('rate', self.speed)
-
-            # 静音预热：清空 SAPI 残留内容
-            engine.setProperty('volume', 0.0)
-            engine.say(' ')
-            engine.runAndWait()
-            engine.setProperty('volume', 1.0)
-            print("[TTS] 语音引擎初始化成功")
+            self.engine.setProperty('rate', self.speed)
+            self._engine_ready = True
+            print("[TTS] 语音引擎初始化成功（WAV模式）- 准备就绪", flush=True)
         except ImportError:
-            print("[TTS] pyttsx3 未安装，语音功能不可用")
-            engine = None
+            print("[TTS] pyttsx3 未安装，语音功能不可用", flush=True)
+            self.engine = None
         except Exception as e:
-            print(f"[TTS] 语音引擎初始化失败: {e}")
-            engine = None
+            print(f"[TTS] 语音引擎初始化失败: {e}", flush=True)
+            self.engine = None
 
-        # 进入消费循环
-        while True:
-            item = self._queue.get()
-            if item is self._STOP_SENTINEL:
-                break
-            text, callback, rate_override = item
-
-            if engine and text and not self.muted:
-                try:
-                    if rate_override is not None:
-                        engine.setProperty('rate', rate_override)
-                    engine.say(text)
-                    engine.runAndWait()
-                except Exception as e:
-                    print(f"[TTS] 朗读失败: {e}")
-
-            if callback:
-                try:
-                    callback()
-                except Exception:
-                    pass
-
-    # ------------------------------------------------------------------
-    # 公共接口
-    # ------------------------------------------------------------------
     def set_speed(self, rate):
         """设置语速 0.7-1.2 -> 100-200"""
         self.speed = int(100 + (rate - 0.7) * 500)
+        if self.engine:
+            try:
+                self.engine.setProperty('rate', self.speed)
+            except Exception:
+                pass
 
     def speak(self, text, callback=None):
-        """异步朗读（立即返回，由工作线程处理）"""
-        if not text:
+        """
+        异步朗读（后台线程生成 WAV -> 主线程 winsound 播放）
+        不阻塞 GUI。
+        """
+        print(f"[TTS] speak() 调用: {repr(text)}", flush=True)
+        if not text or self.muted:
             if callback:
                 callback()
             return
         clean = self._clean_text(text)
-        if clean:
-            self._queue.put((clean, callback, self.speed if self.speed != 150 else None))
-        elif callback:
-            callback()
+        print(f"[TTS] 清理后: {repr(clean)}", flush=True)
+        if not clean:
+            if callback:
+                callback()
+            return
+        if not self.engine:
+            if callback:
+                callback()
+            return
+
+        # 生成唯一临时文件名
+        self._wav_counter += 1
+        wav_path = os.path.join(self.temp_dir, f"speech_{self._wav_counter}.wav")
+        print(f"[TTS] 后台线程生成 WAV: {wav_path}", flush=True)
+
+        def do_generate():
+            """后台线程：生成 WAV 文件"""
+            try:
+                self.engine.save_to_file(clean, wav_path)
+                self.engine.runAndWait()
+                print(f"[TTS] WAV 生成完成: {wav_path}, 大小: {os.path.getsize(wav_path)} bytes", flush=True)
+                # 切回主线程播放
+                if self.root:
+                    self.root.after(0, lambda: self._play_wav(wav_path, clean, callback))
+                else:
+                    print("[TTS] 警告：没有 root，无法切回主线程播放", flush=True)
+                    if callback:
+                        try: callback()
+                        except: pass
+            except Exception as e:
+                print(f"[TTS] WAV 生成失败: {e}", flush=True)
+                if callback:
+                    try: callback()
+                    except: pass
+
+        threading.Thread(target=do_generate, daemon=True).start()
+
+    def _play_wav(self, wav_path, original_text, callback):
+        """主线程：用 winsound 播放 WAV 文件"""
+        try:
+            if not os.path.exists(wav_path):
+                print(f"[TTS] WAV 文件不存在: {wav_path}", flush=True)
+                return
+            print(f"[TTS] 开始播放 WAV: {wav_path}", flush=True)
+            self.current_wav = wav_path
+            # SND_FILENAME: 播放指定 WAV 文件；同步播放（播放完才返回）
+            winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+            print(f"[TTS] 播放完成: {wav_path}", flush=True)
+        except Exception as e:
+            print(f"[TTS] 播放失败: {e}", flush=True)
+        finally:
+            # 播放完成后删除临时文件
+            try:
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+                    print(f"[TTS] 删除临时文件: {wav_path}", flush=True)
+            except Exception as e:
+                print(f"[TTS] 删除临时文件失败: {e}", flush=True)
+            self.current_wav = None
+            if callback:
+                try: callback()
+                except: pass
 
     def stop(self):
-        """清空待播队列（不停当前正在播的一句，SAPI 不支持跨线程 stop）"""
+        """停止当前播放（如果正在播放）"""
         try:
-            while not self._queue.empty():
-                self._queue.get_nowait()
+            winsound.PlaySound(None, winsound.SND_PURGE)
         except Exception:
             pass
+        # 删除当前 WAV 文件
+        if self.current_wav and os.path.exists(self.current_wav):
+            try:
+                os.remove(self.current_wav)
+                print(f"[TTS] stop() 删除临时文件: {self.current_wav}", flush=True)
+            except Exception as e:
+                print(f"[TTS] stop() 删除失败: {e}", flush=True)
+            self.current_wav = None
 
     def toggle_mute(self):
         """切换静音"""
         self.muted = not self.muted
-        if self.muted:
-            self.stop()
         return not self.muted
 
     def _clean_text(self, text):
-        """清理文本"""
+        """清理文本：去除 HTML 标签和 emoji"""
         import re
         text = re.sub(r'<[^>]+>', '', text)
-        emoji_pattern = re.compile("["
-            u"\U0001F300-\U0001F9FF" u"\U0001F600-\U0001F64F"
-            u"\U0001F680-\U0001F6FF" u"\U0001F1E0-\U0001F1FF"
-            u"\U00002702-\U000027B0" u"\U000024C2-\U0001F251"
-            "]+", flags=re.UNICODE)
+        # 精确 emoji 范围（注意：不要把 CJK 汉字区 U+4E00-U+9FFF 包含进来）
+        # U+24C2-U+24FF（带圈字符） + U+1F200-U+1F251（带圈表意文字）
+        emoji_pattern = re.compile(
+            '['
+            '\U0001F300-\U0001F5FF'  # 杂项符号与象形文字
+            '\U0001F600-\U0001F64F'  # 表情符号
+            '\U0001F680-\U0001F6FF'  # 交通与地图符号
+            '\U0001F1E0-\U0001F1FF'  # 区域指示符号（国旗）
+            '\U00002702-\U000027B0'  # 标点符号/杂项符号
+            '\U000024C2-\U000024FF'  # 带圈字符（小范围，止步 U+24FF）
+            '\U0001F200-\U0001F251'  # 带圈表意文字补充
+            ']+',
+            flags=re.UNICODE
+        )
         text = emoji_pattern.sub('', text)
+        text = text.replace('\u26AB', '').replace('\u2B1B', '')  # ⚫ 黑圆、⚪ 白圆
+        text = text.replace('\u2B50', '')  # ⭐ 黑星
+        text = text.replace('\u274C', '')  # ❌ 叉
+        text = text.replace('\u2714', '')  # ✔ 钩
+        text = text.replace('\u26A1', '')  # ⚡ 闪电
+        text = text.replace('\u1F4A1', '')  # 💡 灯泡
+        text = text.replace('\u1F3AF', '')  # 🎯 靶心
         text = text.replace('⚫', '黑').replace('⚪', '白')
         return text.strip()
 
@@ -455,7 +516,8 @@ class GoApp:
         self.root.configure(bg='#ffecd2')
 
         self.engine = GoEngine()
-        self.voice = VoiceSystem()
+        self.voice = VoiceSystem(root=self.root)
+        self.voice.init_engine()   # 引擎在 mainloop 启动前初始化（主线程）
         self.speech_queue = queue.Queue()
         self.is_speaking = False
         self.last_speech = ""
@@ -487,6 +549,7 @@ class GoApp:
         rank = RANK_TABLE[self.engine.rank_idx]
         size = self.settings.get('board_size', 9)
         msg = f"新游戏！棋盘是{size}路。你下黑棋先走，对手是{rank[0]}水平。"
+        print(f"[MAIN] _delayed_intro: {msg}", flush=True)
         self._update_speech(msg)
         self.voice.speak(msg)
 
