@@ -20,3 +20,12 @@ Thumbs.db
 # Settings (user-specific)
 settings.json
 rank_progress.json
+
+# Logs & temp test files
+*.log
+run_log.txt
+tts_diagnosis.py
+tts_gui_test.py
+tts_test.py
+tts_tk_test.py
+*.spec

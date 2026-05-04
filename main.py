@@ -11,149 +11,226 @@ import json
 import os
 import tempfile
 import winsound
+import subprocess
 
 # ============================================================
-# 语音系统（WAV文件 + winsound 播放，彻底绕开COM线程问题）
+# 语音系统（参考 HTML 版的 voiceQueue 设计，顺序播放无间断）
+#
+# 架构：
+#   speak(text) --> 入队 voice_queue
+#   process_queue() --> 取队首，后台生成 WAV，主线程 winsound.PlaySound() 播放
+#   _play_wav() 播完 --> finish_current() --> 处理 callback + pending_ai_move --> 继续队列
+#
+# winsound.PlaySound(SND_FILENAME) 是同步的（阻塞直到播完），
+# 因此自然形成顺序播放，消除间断。
 # ============================================================
 class VoiceSystem:
-    """
-    方案：
-      1. 后台线程用 pyttsx3.save_to_file() 生成 WAV 文件（不受COM线程模型影响）
-      2. 生成完毕后切回主线程，用 winsound.PlaySound() 播放 WAV
-      3. 播放完成后删除临时 WAV 文件
-    优点：彻底绕开后台线程中 SAPI5 runAndWait() 不发声的问题。
-    """
 
     def __init__(self, root=None):
-        self.root = root          # Tk 根窗口，用于 after() 切回主线程
+        self.root = root
         self.muted = False
         self.speed = 150
-        self.engine = None
-        self._engine_ready = False
+        self._engine = None
+        self._engine_ready = False   # 引擎是否已完成初始化
         self.temp_dir = tempfile.mkdtemp(prefix='go_voice_')
-        self.current_wav = None   # 当前正在播放的 WAV 路径
-        self._wav_counter = 0     # 生成唯一文件名
+        self._wav_counter = 0
+
+        self.voice_queue = []
+        self.voice_playing = False
+        self.pending_ai_move = None
+        self._engine_lock = threading.Lock()
+
+    def _get_engine(self):
+        """在调用线程内懒初始化引擎（必须在同一线程调用 save_to_file）"""
+        if self._engine is not None:
+            return self._engine
+        if not self._engine_ready:
+            with self._engine_lock:
+                # 双重检查
+                if self._engine is None:
+                    try:
+                        import pyttsx3
+                        eng = pyttsx3.init()
+                        voices = eng.getProperty('voices')
+                        for v in voices:
+                            if 'chinese' in v.name.lower() or 'zh' in v.name.lower():
+                                eng.setProperty('voice', v.id)
+                                break
+                        eng.setProperty('rate', self.speed)
+                        self._engine = eng
+                        self._engine_ready = True
+                        print("[TTS] 引擎在后台线程内初始化成功", flush=True)
+                    except Exception as e:
+                        print(f"[TTS] 引擎初始化失败: {e}", flush=True)
+                        self._engine_ready = True  # 防止重复尝试
+        return self._engine
+
+    def warmup(self):
+        """预热引擎：在后台线程提前创建好，用户点击时引擎已就绪"""
+        def _do_warmup():
+            self._get_engine()
+        threading.Thread(target=_do_warmup, daemon=True).start()
 
     def init_engine(self):
-        """在主线程调用（延迟初始化）"""
-        if self._engine_ready:
-            return
-        try:
-            import pyttsx3
-            self.engine = pyttsx3.init()
-            voices = self.engine.getProperty('voices')
-            for v in voices:
-                if 'chinese' in v.name.lower() or 'zh' in v.name.lower():
-                    self.engine.setProperty('voice', v.id)
-                    print(f"[TTS] 使用语音: {v.name}", flush=True)
-                    break
-            self.engine.setProperty('rate', self.speed)
-            self._engine_ready = True
-            print("[TTS] 语音引擎初始化成功（WAV模式）- 准备就绪", flush=True)
-        except ImportError:
-            print("[TTS] pyttsx3 未安装，语音功能不可用", flush=True)
-            self.engine = None
-        except Exception as e:
-            print(f"[TTS] 语音引擎初始化失败: {e}", flush=True)
-            self.engine = None
+        """兼容旧调用：触发后台线程预热引擎"""
+        self.warmup()
 
     def set_speed(self, rate):
         """设置语速 0.7-1.2 -> 100-200"""
         self.speed = int(100 + (rate - 0.7) * 500)
-        if self.engine:
-            try:
-                self.engine.setProperty('rate', self.speed)
-            except Exception:
-                pass
 
-    def speak(self, text, callback=None):
+    def speak(self, text, priority=False, callback=None, turn='player'):
         """
-        异步朗读（后台线程生成 WAV -> 主线程 winsound 播放）
-        不阻塞 GUI。
+        priority=True : 打断当前播放，清空队列，立即播这条（最高优先）
+        priority=False: 排队，等当前播完再播（默认，参考 HTML 版的 speak）
         """
-        print(f"[TTS] speak() 调用: {repr(text)}", flush=True)
+        print(f"[TTS] speak() 调用: {repr(text[:50]) if text else None}..., priority={priority}", flush=True)
         if not text or self.muted:
-            if callback:
-                callback()
-            return
-        clean = self._clean_text(text)
-        print(f"[TTS] 清理后: {repr(clean)}", flush=True)
-        if not clean:
-            if callback:
-                callback()
-            return
-        if not self.engine:
-            if callback:
-                callback()
-            return
-
-        # 生成唯一临时文件名
-        self._wav_counter += 1
-        wav_path = os.path.join(self.temp_dir, f"speech_{self._wav_counter}.wav")
-        print(f"[TTS] 后台线程生成 WAV: {wav_path}", flush=True)
-
-        def do_generate():
-            """后台线程：生成 WAV 文件"""
-            try:
-                self.engine.save_to_file(clean, wav_path)
-                self.engine.runAndWait()
-                print(f"[TTS] WAV 生成完成: {wav_path}, 大小: {os.path.getsize(wav_path)} bytes", flush=True)
-                # 切回主线程播放
-                if self.root:
-                    self.root.after(0, lambda: self._play_wav(wav_path, clean, callback))
-                else:
-                    print("[TTS] 警告：没有 root，无法切回主线程播放", flush=True)
-                    if callback:
-                        try: callback()
-                        except: pass
-            except Exception as e:
-                print(f"[TTS] WAV 生成失败: {e}", flush=True)
-                if callback:
-                    try: callback()
-                    except: pass
-
-        threading.Thread(target=do_generate, daemon=True).start()
-
-    def _play_wav(self, wav_path, original_text, callback):
-        """主线程：用 winsound 播放 WAV 文件"""
-        try:
-            if not os.path.exists(wav_path):
-                print(f"[TTS] WAV 文件不存在: {wav_path}", flush=True)
-                return
-            print(f"[TTS] 开始播放 WAV: {wav_path}", flush=True)
-            self.current_wav = wav_path
-            # SND_FILENAME: 播放指定 WAV 文件；同步播放（播放完才返回）
-            winsound.PlaySound(wav_path, winsound.SND_FILENAME)
-            print(f"[TTS] 播放完成: {wav_path}", flush=True)
-        except Exception as e:
-            print(f"[TTS] 播放失败: {e}", flush=True)
-        finally:
-            # 播放完成后删除临时文件
-            try:
-                if os.path.exists(wav_path):
-                    os.remove(wav_path)
-                    print(f"[TTS] 删除临时文件: {wav_path}", flush=True)
-            except Exception as e:
-                print(f"[TTS] 删除临时文件失败: {e}", flush=True)
-            self.current_wav = None
             if callback:
                 try: callback()
                 except: pass
+            return
+        clean = self._clean_text(text)
+        if not clean:
+            if callback:
+                try: callback()
+                except: pass
+            return
+
+        if priority and self.voice_playing:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+            self.voice_queue = []
+            self.voice_playing = False
+            print("[TTS] 打断当前播放，清空队列", flush=True)
+
+        self.voice_queue.append({'text': clean, 'callback': callback, 'turn': turn})
+        self.process_queue()
+
+    def process_queue(self):
+        """
+        从队列取一条，后台线程生成 WAV，主线程播放。
+        播完后自动触发 finish_current() 继续下一条。
+        """
+        if self.voice_playing or not self.voice_queue:
+            return
+
+        item = self.voice_queue.pop(0)
+        self.voice_playing = True
+
+        self._wav_counter += 1
+        wav_path = os.path.join(self.temp_dir, f"speech_{self._wav_counter}.wav")
+        print(f"[TTS] 开始处理队列项: {repr(item['text'][:30])}...", flush=True)
+
+        def do_generate():
+            """后台线程：生成 WAV 文件（引擎在本线程内懒创建）"""
+            engine = self._get_engine()
+            if not engine:
+                print("[TTS] 引擎不可用，跳过本条", flush=True)
+                self.finish_current(item, skip_play=True)
+                return
+            try:
+                engine.save_to_file(item['text'], wav_path)
+                engine.runAndWait()
+                if not os.path.exists(wav_path):
+                    print(f"[TTS] WAV 文件未生成: {wav_path}", flush=True)
+                    self.finish_current(item, skip_play=True)
+                    return
+                size = os.path.getsize(wav_path)
+                print(f"[TTS] WAV 生成完成: size={size}", flush=True)
+                if self.root:
+                    self.root.after(0, lambda: self._play_wav(wav_path, item))
+                else:
+                    self._play_wav(wav_path, item)
+            except Exception as e:
+                print(f"[TTS] WAV 生成失败: {e}", flush=True)
+                self.finish_current(item, skip_play=True)
+
+        threading.Thread(target=do_generate, daemon=True).start()
+
+    def _play_wav(self, wav_path, item):
+        """主线程：播放 WAV，失败后降级到 powershell TTS"""
+        try:
+            if not os.path.exists(wav_path):
+                print(f"[TTS][WAV] 文件不存在，降级 TTS: {wav_path}", flush=True)
+                self._fallback_speak(item['text'])
+                return
+            fsize = os.path.getsize(wav_path)
+            print(f"[TTS][WAV] 播放 size={fsize}, path={wav_path}", flush=True)
+            if fsize < 44:
+                print("[TTS][WAV] 文件过小，降级 TTS", flush=True)
+                self._fallback_speak(item['text'])
+                return
+            winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+            print(f"[TTS][WAV] 播放完成: {item['text'][:30]}", flush=True)
+        except Exception as e:
+            print(f"[TTS][WAV] 播放失败={e}，降级 TTS", flush=True)
+            self._fallback_speak(item['text'])
+        finally:
+            try:
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except Exception:
+                pass
+            self.finish_current(item, skip_play=True)
+
+    def _fallback_speak(self, text):
+        """降级：用 powershell 播报（不依赖 pyttsx3 WAV）"""
+        try:
+            safe = text.replace('"', "'").replace('\n', ' ')
+            ps = f'Add-Type -AssemblyName System.Speech; $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Rate=1; $s.Speak("{safe}")'
+            subprocess.run(['powershell', '-NonInteractive', '-Command', ps],
+                          capture_output=True, timeout=10)
+            print(f"[TTS][FALLBACK] powershell 播报完成: {text[:30]}", flush=True)
+        except Exception as e:
+            print(f"[TTS][FALLBACK] 也失败了: {e}", flush=True)
+
+    def finish_current(self, item, skip_play=False):
+        """
+        播完一条语音后（参考 HTML 版的 finishCurrentSpeech）：
+          1. 执行 item['callback']（如 AI 落子回调）
+          2. 如果有 pending_ai_move → 执行它（AI 等玩家语音播完再落子）
+          3. 否则继续 process_queue() 播放下一条
+        """
+        self.voice_playing = False
+        if item['callback']:
+            try:
+                item['callback']()
+            except Exception as e:
+                print(f"[TTS] callback 执行失败: {e}", flush=True)
+
+        # 参考 HTML 版的 finishCurrentSpeech：优先处理 pending_ai_move
+        if self.pending_ai_move:
+            cb = self.pending_ai_move
+            self.pending_ai_move = None
+            print("[TTS] 执行 pending_ai_move（AI等玩家语音播完）", flush=True)
+            cb()
+        else:
+            print("[TTS] 继续队列下一条", flush=True)
+            self.process_queue()
+
+    def set_pending_ai_move(self, callback):
+        """设置 AI 移动回调（AI 等待玩家语音播完后再落子）"""
+        self.pending_ai_move = callback
 
     def stop(self):
-        """停止当前播放（如果正在播放）"""
+        """停止当前播放，清空队列"""
         try:
             winsound.PlaySound(None, winsound.SND_PURGE)
         except Exception:
             pass
-        # 删除当前 WAV 文件
-        if self.current_wav and os.path.exists(self.current_wav):
-            try:
-                os.remove(self.current_wav)
-                print(f"[TTS] stop() 删除临时文件: {self.current_wav}", flush=True)
-            except Exception as e:
-                print(f"[TTS] stop() 删除失败: {e}", flush=True)
-            self.current_wav = None
+        self.voice_queue = []
+        self.voice_playing = False
+        self.pending_ai_move = None
+        # 清理所有临时 WAV 文件
+        try:
+            for f in os.listdir(self.temp_dir):
+                if f.endswith('.wav'):
+                    os.remove(os.path.join(self.temp_dir, f))
+        except Exception as e:
+            print(f"[TTS] stop() 清理失败: {e}", flush=True)
 
     def toggle_mute(self):
         """切换静音"""
@@ -164,28 +241,23 @@ class VoiceSystem:
         """清理文本：去除 HTML 标签和 emoji"""
         import re
         text = re.sub(r'<[^>]+>', '', text)
-        # 精确 emoji 范围（注意：不要把 CJK 汉字区 U+4E00-U+9FFF 包含进来）
-        # U+24C2-U+24FF（带圈字符） + U+1F200-U+1F251（带圈表意文字）
         emoji_pattern = re.compile(
             '['
-            '\U0001F300-\U0001F5FF'  # 杂项符号与象形文字
-            '\U0001F600-\U0001F64F'  # 表情符号
-            '\U0001F680-\U0001F6FF'  # 交通与地图符号
-            '\U0001F1E0-\U0001F1FF'  # 区域指示符号（国旗）
-            '\U00002702-\U000027B0'  # 标点符号/杂项符号
-            '\U000024C2-\U000024FF'  # 带圈字符（小范围，止步 U+24FF）
-            '\U0001F200-\U0001F251'  # 带圈表意文字补充
+            '\U0001F300-\U0001F5FF'
+            '\U0001F600-\U0001F64F'
+            '\U0001F680-\U0001F6FF'
+            '\U0001F1E0-\U0001F1FF'
+            '\U00002702-\U000027B0'
+            '\U000024C2-\U000024FF'
+            '\U0001F200-\U0001F251'
             ']+',
             flags=re.UNICODE
         )
         text = emoji_pattern.sub('', text)
-        text = text.replace('\u26AB', '').replace('\u2B1B', '')  # ⚫ 黑圆、⚪ 白圆
-        text = text.replace('\u2B50', '')  # ⭐ 黑星
-        text = text.replace('\u274C', '')  # ❌ 叉
-        text = text.replace('\u2714', '')  # ✔ 钩
-        text = text.replace('\u26A1', '')  # ⚡ 闪电
-        text = text.replace('\u1F4A1', '')  # 💡 灯泡
-        text = text.replace('\u1F3AF', '')  # 🎯 靶心
+        text = text.replace('\u26AB', '').replace('\u2B1B', '')
+        text = text.replace('\u2B50', '').replace('\u274C', '')
+        text = text.replace('\u2714', '').replace('\u26A1', '')
+        text = text.replace('\u1F4A1', '').replace('\u1F3AF', '')
         text = text.replace('⚫', '黑').replace('⚪', '白')
         return text.strip()
 
@@ -517,7 +589,6 @@ class GoApp:
 
         self.engine = GoEngine()
         self.voice = VoiceSystem(root=self.root)
-        self.voice.init_engine()   # 引擎在 mainloop 启动前初始化（主线程）
         self.speech_queue = queue.Queue()
         self.is_speaking = False
         self.last_speech = ""
@@ -538,20 +609,22 @@ class GoApp:
         # ★ 在画板绘制完成之后再设置窗口大小，防止被覆盖
         self._update_window_size()
 
-        # 窗口显示后延迟播报（等待2秒确保TTS完全就绪）
-        self.root.after(2000, self._delayed_intro)
+        # 窗口显示后延迟播报（延迟足够长确保TTS完全就绪）
+        self.root.after(500, self._delayed_intro)
 
         # 启动主循环
         self.root.mainloop()
 
     def _delayed_intro(self):
-        """延迟播报开场白"""
+        """延迟播报开场白（引擎改为懒初始化，无需手动调用 init_engine）"""
         rank = RANK_TABLE[self.engine.rank_idx]
         size = self.settings.get('board_size', 9)
         msg = f"新游戏！棋盘是{size}路。你下黑棋先走，对手是{rank[0]}水平。"
         print(f"[MAIN] _delayed_intro: {msg}", flush=True)
         self._update_speech(msg)
         self.voice.speak(msg)
+        # 开场白播完后（延迟3秒）预热引擎，用户点击时已就绪
+        self.root.after(3000, self.voice.warmup)
 
     def _load_settings(self):
         """加载设置"""
@@ -953,7 +1026,7 @@ class GoApp:
         success, msg = self.engine.place_stone(row, col, BLACK)
         if not success:
             self._update_speech(msg)
-            self.voice.speak(msg)
+            self.voice.speak(msg, priority=True)
             return
 
         self._update_history()
@@ -964,61 +1037,72 @@ class GoApp:
         # 生成解说
         commentary = self._generate_commentary(row, col, BLACK)
         self._update_speech(commentary)
-        self.voice.speak(commentary)
 
-        # 切换到AI回合
+        # 切换到AI回合（立即切走，防止重复点击）
         self.engine.current_player = WHITE
         self._update_status()
 
-        # AI思考
-        self.root.after(500, self._ai_move)
+        # 玩家语音播完后 → 执行 pending_ai_move（AI落子）
+        self.voice.set_pending_ai_move(self._do_ai)
+        # 入队玩家解说语音，callback 会在播完后触发 pending_ai_move
+        self.voice.speak(commentary, priority=False, callback=None, turn='player')
 
-    def _ai_move(self):
-        """AI落子"""
+    def _do_ai(self):
+        """
+        AI 实际落子（在 pending_ai_move 回调里执行）。
+        参考 HTML 版 aiMove() 逻辑，同步计算+落子，不阻塞（计算很快）。
+        """
         if self.engine.game_over:
+            self.voice.pending_ai_move = None
             return
 
         self.engine.ai_thinking = True
         self._update_status()
 
-        # AI思考延迟
-        def do_ai():
-            r, c = self.engine.ai_move()
-            if r is None:
-                # AI跳过
-                self.engine.consecutive_passes += 1
-                self.engine.ko_point = None
-                self.engine.history.append({'player': WHITE, 'row': -1, 'col': -1, 'captured': 0, 'pos': 'Pass'})
-                self.engine.move_count += 1
+        r, c = self.engine.ai_move()
+        if r is None:
+            # AI跳过
+            self.engine.consecutive_passes += 1
+            self.engine.ko_point = None
+            self.engine.history.append({'player': WHITE, 'row': -1, 'col': -1, 'captured': 0, 'pos': 'Pass'})
+            self.engine.move_count += 1
 
-                if self.engine.consecutive_passes >= 2:
-                    self.root.after(0, self._end_game)
-                else:
-                    self.root.after(0, self._update_status)
-                    self.root.after(0, self._update_history)
-                    self.root.after(0, self._update_scores)
-                    self.root.after(0, self._draw_board)
-                    self.root.after(0, lambda: self._update_speech("电脑跳过了这一手"))
-                    self.root.after(0, lambda: self.voice.speak("电脑跳过了这一手"))
-                    self.engine.current_player = BLACK
-                    self.engine.ai_thinking = False
+            if self.engine.consecutive_passes >= 2:
+                self.voice.pending_ai_move = None
+                self._end_game()
             else:
-                self.engine.place_stone(r, c, WHITE)
-                self.root.after(0, self._update_history)
-                self.root.after(0, self._update_scores)
-                self.root.after(0, self._draw_board)
-
-                commentary = self._generate_commentary(r, c, WHITE)
-                self.root.after(0, lambda: self._update_speech(commentary))
-                self.root.after(0, lambda: self.voice.speak(commentary))
-
                 self.engine.current_player = BLACK
                 self.engine.ai_thinking = False
+                self._update_status()
+                self._update_history()
+                self._update_scores()
+                self._draw_board()
+                # AI 跳过：解说入队，播完后切回玩家
+                self.voice.set_pending_ai_move(self._resume_player_turn)
+                self.voice.speak("电脑跳过了这一手", turn='ai')
+        else:
+            self.engine.place_stone(r, c, WHITE)
+            self._update_history()
+            self._update_scores()
+            self._draw_board()
 
-            self.root.after(0, self._update_status)
+            commentary = self._generate_commentary(r, c, WHITE)
+            self._update_speech(commentary)
 
-        thread = threading.Thread(target=do_ai, daemon=True)
-        thread.start()
+            self.engine.current_player = BLACK
+            self.engine.ai_thinking = False
+            self._update_status()
+
+            # AI 解说入队，播完后 → 切回玩家回合（_resume_player_turn）
+            self.voice.set_pending_ai_move(self._resume_player_turn)
+            self.voice.speak(commentary, turn='ai')
+
+    def _resume_player_turn(self):
+        """AI语音播完后：切回玩家回合，清除 pending"""
+        self.engine.current_player = BLACK
+        self.engine.ai_thinking = False
+        self.voice.pending_ai_move = None
+        self._update_status()
 
     def _generate_commentary(self, row, col, player):
         """生成解说"""
